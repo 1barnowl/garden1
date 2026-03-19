@@ -1,3 +1,0 @@
-"""Detect sudden sentiment shifts vs historical baseline; trigger alert rules."""
-class AnomalyDetector:
-    def detect(self, aggregate: dict, baseline: dict) -> bool: ...
