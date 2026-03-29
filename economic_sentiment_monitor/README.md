@@ -1,6 +1,6 @@
 # Economic Sentiment Monitor (ESM)
 
-A Bloomberg-style terminal dashboard for real-time economic sentiment analysis.
+A terminal dashboard for real-time economic sentiment analysis.
 100% free data sources. No paid subscriptions required.
 
 ```
