@@ -37,12 +37,12 @@ python3 monitor.py
 
 | Tab | Content |
 |-----|---------|
-| 📈 EQUITIES | SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMZN, META, JPM + sentiment overlay |
-| 🌍 MACRO/FX | Gold, Oil, BTC, ETH, EUR/USD, GBP/USD, JPY, USD Index, bonds |
-| 🗂 SECTORS | All 11 S&P sectors via ETF (XLK, XLF, XLE…) with heatmap |
-| 🧠 SENTIMENT | Theme scores: inflation, rates, growth, employment, trade, credit |
-| 📰 NEWS FEED | Latest 60 headlines with VADER sentiment score |
-| 🔔 ALERTS | Sharp sentiment-shift alerts (WARN/CRIT) |
+|  EQUITIES | SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMZN, META, JPM + sentiment overlay |
+|  MACRO/FX | Gold, Oil, BTC, ETH, EUR/USD, GBP/USD, JPY, USD Index, bonds |
+|  SECTORS | All 11 S&P sectors via ETF (XLK, XLF, XLE…) with heatmap |
+|  SENTIMENT | Theme scores: inflation, rates, growth, employment, trade, credit |
+|  NEWS FEED | Latest 60 headlines with VADER sentiment score |
+|  ALERTS | Sharp sentiment-shift alerts (WARN/CRIT) |
 
 ## Data Sources (all free)
 
