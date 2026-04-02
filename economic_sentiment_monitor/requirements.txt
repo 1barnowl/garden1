@@ -1,19 +1,24 @@
-# ── core (required) ──────────────────────────────────────────────
+# ── core (required) ───────────────────────────────────────────────────────────
 textual>=0.47.0
 yfinance>=0.2.36
 feedparser>=6.0.11
 vaderSentiment>=3.3.2
 requests>=2.31.0
- 
-# ── accurate-tier NLP (optional but recommended) ─────────────────
-# FinBERT: financial-domain transformer (~500 MB download, cached)
-#   pip install transformers torch --break-system-packages
+
+# ── full article text (optional, strongly recommended) ────────────────────────
+# pip install newspaper3k --break-system-packages
+newspaper3k>=0.2.8
+
+# ── accurate NLP tier (optional, ~500MB download, CPU-runnable) ───────────────
+# pip install transformers torch --break-system-packages
 transformers>=4.38.0
 torch>=2.0.0
- 
-# ── entity linking (optional but recommended) ────────────────────
-# SpaCy NER:
-#   pip install spacy --break-system-packages
-#   python -m spacy download en_core_web_sm
+
+# ── entity linking (optional, ~50MB) ─────────────────────────────────────────
+# pip install spacy --break-system-packages
+# python -m spacy download en_core_web_sm
 spacy>=3.7.0
- 
+
+# ── config file parsing (optional — falls back to manual parser) ──────────────
+# pip install pyyaml --break-system-packages
+pyyaml>=6.0
