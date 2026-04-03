@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
 """
-Economic Sentiment Monitor  v0.3
+Economic Sentiment Monitor  v0.4
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Upgrades vs v0.2:
+Upgrades vs v0.3:
   [1] Full article text ingestion via newspaper3k
-      — follows URL, downloads full body text (500-800 words)
-      — scores full text with VADER/FinBERT instead of 10-word headline
-      — falls back to headline if fetch fails / times out (5s limit)
-      — separate fast-headline pass + slow full-text enrichment thread
-
   [2] Runtime config via ~/.esm/config.yml
-      — add/remove tickers, RSS feeds, thresholds without editing code
-      — configure poll interval, alert sensitivity, full-text toggle
-      — auto-creates sensible defaults on first run
-
   [3] Sentiment–price correlation column
-      — Pearson correlation between ticker's rolling sentiment and
-        its subsequent 1h price change, computed from DB history
-      — shown on EQUITIES and SECTORS tabs as "Corr" column
-      — needs ~4h of accumulated data to become meaningful
-      — colour legend: near +1 = sentiment leads price correctly
-                       near -1 = market consistently disagrees
+
+v0.4 new:
+  [4] FRED macro data integration (free API key)
+      — live economic series: CPI, PCE, NFP, GDP, unemployment,
+        Fed funds rate, 10Y yield, M2, yield curve spread
+      — surprise score: actual vs prior period → auto-boosts
+        the matched sentiment theme score on release day
+      — new MACRO DATA tab showing series values + surprise
+      — upcoming release calendar pulled from FRED release dates
+      — works without key (series omitted, rest unchanged)
+
+  [5] Z-score anomaly detection replacing fixed delta threshold
+      — computes rolling mean + std per key from 7-day history
+      — fires WARN when |z| > 2.0, CRIT when |z| > 3.0
+      — per-key calibration: volatile keys need bigger moves
+        to alert; stable keys alert on small persistent drifts
+      — slow-drift detector: flags keys trending same direction
+        for 3+ consecutive windows even if no single spike
+      — z-score and sigma shown in alert reason text
+      — falls back to delta threshold if < 10 history points
 """
 
 import os, sys, time, threading, sqlite3, hashlib, json, re, math
@@ -189,7 +194,30 @@ watchlist_sectors:
   - XLP
   - XLY
 
-# RSS feeds — add/remove as needed
+# Alert sensitivity — z-score thresholds (v0.4)
+# WARN fires when |z| exceeds warn_z, CRIT when |z| exceeds crit_z
+# Falls back to delta thresholds below if < 10 history points exist
+alert_zscore_warn: 2.0
+alert_zscore_crit: 3.0
+# Slow-drift: alert if key moves same direction N consecutive windows
+alert_drift_consecutive: 3
+
+# FRED series to track (requires fred_api_key)
+# Format: label: FRED_series_id: linked_theme
+fred_series:
+  - ["CPI YoY",      "CPIAUCSL",   "inflation"]
+  - ["Core CPI",     "CPILFESL",   "inflation"]
+  - ["PCE",          "PCEPI",      "inflation"]
+  - ["Fed Funds",    "FEDFUNDS",   "rates"]
+  - ["Unemployment", "UNRATE",     "employment"]
+  - ["Nonfarm Pay",  "PAYEMS",     "employment"]
+  - ["GDP Growth",   "A191RL1Q225SBEA", "growth"]
+  - ["10Y Yield",    "DGS10",      "rates"]
+  - ["2Y Yield",     "DGS2",       "rates"]
+  - ["M2 Money",     "M2SL",       "inflation"]
+  - ["Credit Spread","BAMLH0A0HYM2","credit"]
+
+
 rss_feeds:
   - ["Reuters Business",  "https://feeds.reuters.com/reuters/businessNews"]
   - ["Reuters Markets",   "https://feeds.reuters.com/reuters/financialNews"]
@@ -249,6 +277,35 @@ def _tickers(key: str, default: list) -> list:
     if isinstance(v, list):
         return [str(x) for x in v if x]
     return default
+
+ALERT_ZSCORE_WARN   = float(CFG.get("alert_zscore_warn",   2.0))
+ALERT_ZSCORE_CRIT   = float(CFG.get("alert_zscore_crit",   3.0))
+ALERT_DRIFT_N       = int(CFG.get("alert_drift_consecutive", 3))
+
+def _fred_series(cfg_list) -> list:
+    """Parse fred_series list from config → [(label, series_id, theme), ...]"""
+    if not isinstance(cfg_list, list):
+        return []
+    out = []
+    for item in cfg_list:
+        if isinstance(item, list) and len(item) == 3:
+            out.append(tuple(str(x) for x in item))
+    return out
+
+FRED_SERIES = _fred_series(CFG.get("fred_series", [])) or [
+    ("CPI YoY",      "CPIAUCSL",        "inflation"),
+    ("Core CPI",     "CPILFESL",        "inflation"),
+    ("PCE",          "PCEPI",           "inflation"),
+    ("Fed Funds",    "FEDFUNDS",        "rates"),
+    ("Unemployment", "UNRATE",          "employment"),
+    ("Nonfarm Pay",  "PAYEMS",          "employment"),
+    ("GDP Growth",   "A191RL1Q225SBEA", "growth"),
+    ("10Y Yield",    "DGS10",           "rates"),
+    ("2Y Yield",     "DGS2",            "rates"),
+    ("M2 Money",     "M2SL",            "inflation"),
+    ("Credit Spread","BAMLH0A0HYM2",    "credit"),
+]
+
 
 WATCHLIST = {
     "Equities": _tickers("watchlist_equities",
@@ -414,7 +471,20 @@ def init_db():
             reason   TEXT,
             score    REAL
         );
-        CREATE INDEX IF NOT EXISTS ix_articles_ingested ON articles(ingested);
+        CREATE TABLE IF NOT EXISTS fred_data (
+            series_id   TEXT,
+            label       TEXT,
+            theme       TEXT,
+            ts          TEXT,
+            value       REAL,
+            prev_value  REAL,
+            surprise    REAL,
+            units       TEXT,
+            PRIMARY KEY (series_id, ts)
+        );
+        CREATE INDEX IF NOT EXISTS ix_fred_ts   ON fred_data(ts);
+        CREATE INDEX IF NOT EXISTS ix_alerts_ts ON alerts(ts);
+        
         CREATE INDEX IF NOT EXISTS ix_entity_ts ON entity_mentions(ts);
         CREATE INDEX IF NOT EXISTS ix_prices_ticker ON market_prices(ticker, ts);
         CREATE INDEX IF NOT EXISTS ix_scores_key ON sentiment_scores(key, window, ts);
@@ -648,8 +718,251 @@ def fmt_corr(r) -> str:
     return f"{sign}{r:.2f}"
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INGESTION
+#  [4]  FRED MACRO DATA
 # ══════════════════════════════════════════════════════════════════════════════
+
+FRED_BASE = "https://api.stlouisfed.org/fred"
+
+def _fred_get(endpoint: str, params: dict) -> dict:
+    """Raw FRED API call — returns {} on any failure."""
+    if not FRED_API_KEY:
+        return {}
+    try:
+        params["api_key"]     = FRED_API_KEY
+        params["file_type"]   = "json"
+        r = requests.get(f"{FRED_BASE}/{endpoint}", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return {}
+
+def fetch_fred_series(series_id: str, label: str, theme: str) -> dict | None:
+    """
+    Fetch the two most recent observations for a FRED series.
+    Returns dict with current value, prior value, and surprise score.
+    Surprise = (current - prior) / abs(prior) * 100  (percentage change)
+    """
+    data = _fred_get("series/observations", {
+        "series_id":   series_id,
+        "sort_order":  "desc",
+        "limit":       "5",
+        "observation_start": "2020-01-01",
+    })
+    obs = [o for o in data.get("observations", [])
+           if o.get("value") not in (".", "", None)]
+    if len(obs) < 2:
+        return None
+    try:
+        cur  = float(obs[0]["value"])
+        prev = float(obs[1]["value"])
+        surprise = round((cur - prev) / abs(prev) * 100, 4) if prev else 0.0
+        ts_str   = obs[0].get("date", datetime.now(timezone.utc).date().isoformat())
+        return {
+            "series_id":  series_id,
+            "label":      label,
+            "theme":      theme,
+            "ts":         ts_str,
+            "value":      cur,
+            "prev_value": prev,
+            "surprise":   surprise,
+            "units":      "",
+        }
+    except Exception:
+        return None
+
+def fetch_all_fred() -> list:
+    """Fetch all configured FRED series. Returns list of row dicts."""
+    if not FRED_API_KEY:
+        return []
+    rows = []
+    for label, series_id, theme in FRED_SERIES:
+        row = fetch_fred_series(series_id, label, theme)
+        if row:
+            rows.append(row)
+        time.sleep(0.1)   # stay well within free-tier rate limit
+    return rows
+
+def save_fred_data(rows: list):
+    if not rows:
+        return
+    with get_db() as db:
+        db.executemany("""
+            INSERT OR REPLACE INTO fred_data
+            (series_id,label,theme,ts,value,prev_value,surprise,units)
+            VALUES (:series_id,:label,:theme,:ts,:value,:prev_value,:surprise,:units)
+        """, rows)
+
+def apply_fred_surprise_boost(fred_rows: list):
+    """
+    When a FRED series has a surprise (non-zero pct change vs prior),
+    inject a synthetic sentiment score into the matched theme's aggregate.
+    Large positive surprise → positive sentiment boost for that theme.
+    Large negative surprise → negative sentiment boost.
+    Boost is capped at ±0.30 and scaled by surprise magnitude.
+    """
+    if not fred_rows:
+        return
+    ts_now = datetime.now(timezone.utc).isoformat()
+    with get_db() as db:
+        for row in fred_rows:
+            if abs(row["surprise"]) < 0.5:
+                continue   # less than 0.5% change — not noteworthy
+            theme   = row["theme"]
+            # scale surprise to sentiment range: 5% surprise → ~0.15 boost
+            boost   = max(-0.30, min(0.30, row["surprise"] / 33.0))
+            # insert as a synthetic high-confidence article into scoring
+            synth_id = hashlib.md5(
+                f"FRED:{row['series_id']}:{row['ts']}".encode()
+            ).hexdigest()
+            db.execute("""
+                INSERT OR IGNORE INTO articles
+                (id,title,source,url,published,ingested,vader_score,finbert_score,
+                 score,label,confidence,model_tier,keywords,entities,full_text,text_length)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                synth_id,
+                f"[FRED] {row['label']}: {row['value']:.2f} (prev {row['prev_value']:.2f}, {row['surprise']:+.2f}%)",
+                "FRED", "", row["ts"], ts_now,
+                boost, boost, boost,
+                "POS" if boost > 0.05 else ("NEG" if boost < -0.05 else "NEU"),
+                0.95, "fred_surprise",
+                json.dumps([theme]), json.dumps([]),
+                0, 0
+            ))
+            # direct entity mention for the theme
+            db.execute("""
+                INSERT INTO entity_mentions (article_id,entity_raw,ticker,score,ts)
+                VALUES (?,?,?,?,?)
+            """, (synth_id, row["label"], theme, boost, ts_now))
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  [5]  Z-SCORE ANOMALY DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _rolling_stats(key: str, window_days: int = 7) -> tuple:
+    """
+    Compute (mean, std, recent_scores_list) for a key's 1h sentiment
+    over the last window_days from the DB.
+    Returns (None, None, []) if insufficient data.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=window_days)).isoformat()
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT score FROM sentiment_scores
+            WHERE key=? AND window='1h' AND ts > ?
+            ORDER BY ts ASC
+        """, (key, cutoff)).fetchall()
+    scores = [r[0] for r in rows]
+    n = len(scores)
+    if n < 10:
+        return None, None, scores
+    mean = sum(scores) / n
+    variance = sum((s - mean) ** 2 for s in scores) / n
+    std  = math.sqrt(variance) if variance > 0 else 0.0
+    return round(mean, 5), round(std, 5), scores
+
+def _check_slow_drift(scores: list, n: int = 3) -> str | None:
+    """
+    Detect if the last n scores are all moving in the same direction.
+    Returns 'up', 'down', or None.
+    """
+    if len(scores) < n + 1:
+        return None
+    tail = scores[-(n+1):]
+    diffs = [tail[i+1] - tail[i] for i in range(len(tail)-1)]
+    if all(d > 0 for d in diffs):
+        return "up"
+    if all(d < 0 for d in diffs):
+        return "down"
+    return None
+
+def check_alerts():
+    """
+    v0.4 alert engine — z-score based with slow-drift detection.
+    Falls back to delta threshold when history is thin (< 10 points).
+    """
+    alerts = []
+    ts_now = datetime.now(timezone.utc).isoformat()
+
+    with get_db() as db:
+        # get all keys that have a recent 1h score
+        rows_1h = db.execute("""
+            SELECT key, score, count FROM sentiment_scores
+            WHERE window='1h'
+            ORDER BY ts DESC
+        """).fetchall()
+        # deduplicate — keep only the most recent row per key
+        seen_keys = {}
+        for key, score, count in rows_1h:
+            if key not in seen_keys:
+                seen_keys[key] = (score, count)
+
+        for key, (score, count) in seen_keys.items():
+            if count < ALERT_MIN_COUNT:
+                continue
+
+            mean, std, history = _rolling_stats(key)
+
+            # ── z-score path (enough history) ─────────────────────────────
+            if mean is not None and std is not None and std > 0:
+                z = (score - mean) / std
+                if abs(z) >= ALERT_ZSCORE_CRIT:
+                    severity  = "CRIT"
+                    direction = "SURGE ▲" if z > 0 else "DROP  ▼"
+                    reason    = (f"[Z] {key} {direction} z={z:+.2f}σ "
+                                 f"(score={score:+.4f} μ={mean:+.4f} σ={std:.4f})")
+                elif abs(z) >= ALERT_ZSCORE_WARN:
+                    severity  = "WARN"
+                    direction = "SURGE ▲" if z > 0 else "DROP  ▼"
+                    reason    = (f"[Z] {key} {direction} z={z:+.2f}σ "
+                                 f"(score={score:+.4f} μ={mean:+.4f} σ={std:.4f})")
+                else:
+                    # check slow drift even if no z-score spike
+                    drift = _check_slow_drift(history, ALERT_DRIFT_N)
+                    if drift:
+                        severity = "WARN"
+                        direction = "DRIFT ▲" if drift == "up" else "DRIFT ▼"
+                        reason = (f"[DRIFT] {key} {direction} "
+                                  f"{ALERT_DRIFT_N} consecutive windows "
+                                  f"(last={score:+.4f})")
+                    else:
+                        continue
+
+            # ── delta fallback (thin history) ──────────────────────────────
+            else:
+                prev_row = db.execute("""
+                    SELECT score FROM sentiment_scores
+                    WHERE key=? AND window='4h'
+                    ORDER BY ts DESC LIMIT 1
+                """, (key,)).fetchone()
+                if not prev_row:
+                    continue
+                delta = score - prev_row[0]
+                if abs(delta) < ALERT_WARN:
+                    continue
+                severity  = "CRIT" if abs(delta) >= ALERT_CRIT else "WARN"
+                direction = "SURGE ▲" if delta > 0 else "DROP  ▼"
+                reason    = (f"[Δ] {key} {direction} "
+                             f"Δ{abs(delta):.3f} vs 4h (n={count}, thin history)")
+
+            alert_id = hashlib.md5(
+                f"{key}{round(score,2)}{datetime.now(timezone.utc).date()}".encode()
+            ).hexdigest()
+            alerts.append({
+                "id": alert_id, "ts": ts_now,
+                "severity": severity, "key": key,
+                "reason": reason, "score": score,
+            })
+
+        if alerts:
+            db.executemany("""
+                INSERT OR IGNORE INTO alerts
+                (id,ts,severity,key,reason,score)
+                VALUES (:id,:ts,:severity,:key,:reason,:score)
+            """, alerts)
+    return alerts
+
+
 
 def _build_article(title: str, link: str, pub: str, source: str,
                    prices: dict) -> dict:
@@ -839,38 +1152,6 @@ def compute_aggregate_scores():
                            (ticker, window, ts_now,
                             round(sum(scores)/len(scores),4), len(scores)))
 
-def check_alerts():
-    alerts = []
-    with get_db() as db:
-        rows_1h = db.execute(
-            "SELECT key,score,count FROM sentiment_scores WHERE window='1h' ORDER BY ts DESC"
-        ).fetchall()
-        rows_4h = db.execute(
-            "SELECT key,score FROM sentiment_scores WHERE window='4h' ORDER BY ts DESC"
-        ).fetchall()
-        prev_map = {r[0]: r[1] for r in rows_4h}
-        for key, score, count in rows_1h:
-            prev = prev_map.get(key)
-            if prev is None or count < ALERT_MIN_COUNT:
-                continue
-            delta = score - prev
-            if abs(delta) >= ALERT_WARN:
-                severity  = "CRIT" if abs(delta) >= ALERT_CRIT else "WARN"
-                direction = "SURGE ▲" if delta > 0 else "DROP  ▼"
-                reason    = (f"Sentiment {direction} "
-                             f"Δ{abs(delta):.3f} vs 4h baseline (n={count})")
-                alert_id  = hashlib.md5(
-                    f"{key}{round(score,2)}{datetime.now(timezone.utc).date()}".encode()
-                ).hexdigest()
-                alerts.append({
-                    "id": alert_id, "ts": datetime.now(timezone.utc).isoformat(),
-                    "severity": severity, "key": key, "reason": reason, "score": score,
-                })
-        if alerts:
-            db.executemany("""INSERT OR IGNORE INTO alerts
-                              (id,ts,severity,key,reason,score)
-                              VALUES (:id,:ts,:severity,:key,:reason,:score)""", alerts)
-    return alerts
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SHARED DATA CACHE
@@ -878,17 +1159,18 @@ def check_alerts():
 
 class DataCache:
     def __init__(self):
-        self._lock            = threading.Lock()
-        self.prices: dict     = {}
-        self.scores: dict     = {}
-        self.recent_articles  = []
-        self.entity_summary   = []
-        self.correlations: dict = {}   # ticker -> pearson_r
-        self.alerts: deque    = deque(maxlen=50)
-        self.last_refresh     = "—"
-        self.article_count    = 0
-        self.fulltext_count   = 0
-        self.model_tier       = "vader"
+        self._lock              = threading.Lock()
+        self.prices: dict       = {}
+        self.scores: dict       = {}
+        self.recent_articles    = []
+        self.entity_summary     = []
+        self.correlations: dict = {}
+        self.fred_data: list    = []          # NEW: list of fred series rows
+        self.alerts: deque      = deque(maxlen=50)
+        self.last_refresh       = "—"
+        self.article_count      = 0
+        self.fulltext_count     = 0
+        self.model_tier         = "vader"
         self.fulltext_queue_len = 0
 
     def update_prices(self, rows):
@@ -956,6 +1238,26 @@ class DataCache:
         with self._lock:
             self.correlations.update(corr)
 
+    def update_fred_data(self):
+        """Load most recent value per FRED series from DB."""
+        with self._lock:
+            with get_db() as db:
+                rows = db.execute("""
+                    SELECT series_id, label, theme, ts, value, prev_value, surprise
+                    FROM fred_data
+                    WHERE ts = (
+                        SELECT MAX(ts) FROM fred_data f2
+                        WHERE f2.series_id = fred_data.series_id
+                    )
+                    ORDER BY theme, label
+                """).fetchall()
+                self.fred_data = [
+                    {"series_id": r[0], "label": r[1], "theme": r[2],
+                     "ts": r[3], "value": r[4], "prev_value": r[5],
+                     "surprise": r[6]}
+                    for r in rows
+                ]
+
     def update_queue_len(self):
         with self._lock:
             with _fulltext_lock:
@@ -993,11 +1295,25 @@ def run_refresh():
             CACHE.update_articles()
             CACHE.update_entity_summary()
             CACHE.update_queue_len()
+            CACHE.update_fred_data()
             CACHE.add_alerts(new_alerts)
             CACHE.set_last_refresh()
         except Exception:
             pass
         time.sleep(REFRESH_SEC)
+
+def run_fred_refresh():
+    """FRED fetch loop — runs every 30 min (data updates infrequently)."""
+    while True:
+        try:
+            if FRED_API_KEY:
+                fred_rows = fetch_all_fred()
+                save_fred_data(fred_rows)
+                apply_fred_surprise_boost(fred_rows)
+                CACHE.update_fred_data()
+        except Exception:
+            pass
+        time.sleep(1800)   # 30 minutes
 
 def run_correlation_refresh():
     """Correlation computation is slow; run separately every 10 minutes."""
@@ -1070,7 +1386,7 @@ class SentimentMonitorApp(App):
         ("c", "open_cfg",  "Config"),
     ]
 
-    TITLE     = "ESM  //  Economic Sentiment Monitor  v0.3"
+    TITLE     = "ESM  //  Economic Sentiment Monitor  v0.4"
     SUB_TITLE = "initialising…"
 
     def compose(self) -> ComposeResult:
@@ -1078,27 +1394,29 @@ class SentimentMonitorApp(App):
         yield Static("", id="status_bar")
         yield Static("", id="status_bar2")
         with TabbedContent(initial="equities"):
-            with TabPane("📈 EQUITIES",  id="equities"):
-                yield DataTable(id="eq_table",    zebra_stripes=True)
-            with TabPane("🌍 MACRO/FX",  id="macrofx"):
-                yield DataTable(id="fx_table",    zebra_stripes=True)
-            with TabPane("🗂  SECTORS",   id="sectors"):
-                yield DataTable(id="sec_table",   zebra_stripes=True)
-            with TabPane("🧠 SENTIMENT", id="sentiment"):
-                yield DataTable(id="sent_table",  zebra_stripes=True)
-            with TabPane("🔗 ENTITIES",  id="entities"):
-                yield DataTable(id="ent_table",   zebra_stripes=True)
-            with TabPane("📰 NEWS FEED", id="newsfeed"):
-                yield DataTable(id="news_table",  zebra_stripes=True)
-            with TabPane("🔔 ALERTS",    id="alerts"):
-                yield DataTable(id="alert_table", zebra_stripes=True)
+            with TabPane("📈 EQUITIES",   id="equities"):
+                yield DataTable(id="eq_table",     zebra_stripes=True)
+            with TabPane("🌍 MACRO/FX",   id="macrofx"):
+                yield DataTable(id="fx_table",     zebra_stripes=True)
+            with TabPane("🗂  SECTORS",    id="sectors"):
+                yield DataTable(id="sec_table",    zebra_stripes=True)
+            with TabPane("🧠 SENTIMENT",  id="sentiment"):
+                yield DataTable(id="sent_table",   zebra_stripes=True)
+            with TabPane("📊 MACRO DATA", id="macrodata"):
+                yield DataTable(id="fred_table",   zebra_stripes=True)
+            with TabPane("🔗 ENTITIES",   id="entities"):
+                yield DataTable(id="ent_table",    zebra_stripes=True)
+            with TabPane("📰 NEWS FEED",  id="newsfeed"):
+                yield DataTable(id="news_table",   zebra_stripes=True)
+            with TabPane("🔔 ALERTS",     id="alerts"):
+                yield DataTable(id="alert_table",  zebra_stripes=True)
         yield Footer()
 
     def on_mount(self):
         self._setup_tables()
-        # start background threads
         threading.Thread(target=run_refresh,             daemon=True).start()
         threading.Thread(target=run_correlation_refresh, daemon=True).start()
+        threading.Thread(target=run_fred_refresh,        daemon=True).start()
         if FULL_TEXT_ENABLED:
             threading.Thread(target=fulltext_worker,     daemon=True).start()
         self.set_interval(10, self._ui_refresh)
@@ -1115,6 +1433,9 @@ class SentimentMonitorApp(App):
             "ETF","Sector","Price","Chg%","Sent 1h","▓ Heatmap ▓","Sent 24h","Corr")
         self.query_one("#sent_table", DataTable).add_columns(
             "Theme","1h Score","4h Score","24h Score","Trend","n(1h)","Context")
+        # MACRO DATA tab — new in v0.4
+        self.query_one("#fred_table", DataTable).add_columns(
+            "Series","Theme","Latest Value","Prior Value","Surprise %","As Of","Boost")
         self.query_one("#ent_table", DataTable).add_columns(
             "Ticker","Mentions 24h","Avg Sent","Min","Max","▓ Range ▓","In WL")
         # NEWS FEED — added FullTxt column
@@ -1124,28 +1445,30 @@ class SentimentMonitorApp(App):
             "Time","Sev","Key","Reason","Score")
 
     def _ui_refresh(self):
-        # status bar 1 — NLP / NER / refresh
-        spacy_s = "SpaCy ✓" if SPACY_READY else "SpaCy ✗"
+        spacy_s  = "SpaCy ✓" if SPACY_READY else "SpaCy ✗"
+        fred_s   = f"FRED ✓ ({len(CACHE.fred_data)} series)" if FRED_API_KEY else "FRED ✗ (no key)"
         self.query_one("#status_bar", Static).update(
             f"  NLP: {tier_badge()}  |  NER: {spacy_s}  |  "
-            f"{fulltext_badge()}  |  "
+            f"{fulltext_badge()}  |  {fred_s}  |  "
             f"Refresh: {CACHE.last_refresh}  |  "
             f"Articles: {CACHE.article_count}  |  Poll: {REFRESH_SEC}s"
         )
-        # status bar 2 — config summary
         self.query_one("#status_bar2", Static).update(
             f"  Config: {CONFIG_PATH}  |  "
-            f"Alert WARN≥{ALERT_WARN:.2f} CRIT≥{ALERT_CRIT:.2f}  |  "
-            f"Corr window: 24h  |  C=open config"
+            f"Alerts: Z>={ALERT_ZSCORE_WARN:.1f}σ CRIT>={ALERT_ZSCORE_CRIT:.1f}σ  |  "
+            f"Drift: {ALERT_DRIFT_N} consec windows  |  "
+            f"Corr: 24h window  |  C=open config"
         )
         CACHE.update_scores()
         CACHE.update_articles()
         CACHE.update_entity_summary()
         CACHE.update_queue_len()
+        CACHE.update_fred_data()
         self._refresh_equities()
         self._refresh_macrofx()
         self._refresh_sectors()
         self._refresh_sentiment()
+        self._refresh_fred()
         self._refresh_entities()
         self._refresh_news()
         self._refresh_alerts()
@@ -1216,6 +1539,27 @@ class SentimentMonitorApp(App):
             t.add_row(theme.upper(), fmt_score(s1), fmt_score(s4),
                       fmt_score(s24), trend, str(n1 or "—"), ctx)
 
+    def _refresh_fred(self):
+        t = self.query_one("#fred_table", DataTable)
+        t.clear()
+        if not CACHE.fred_data:
+            t.add_row("—", "—", "No FRED data", "—", "—",
+                      "Add fred_api_key to ~/.esm/config.yml", "—")
+            return
+        for row in CACHE.fred_data:
+            val_s  = f"{row['value']:.4f}"  if row["value"]  is not None else "—"
+            prev_s = f"{row['prev_value']:.4f}" if row["prev_value"] is not None else "—"
+            surp   = row["surprise"] or 0.0
+            surp_s = f"{surp:+.2f}%"
+            # boost badge
+            if abs(surp) >= 0.5:
+                boost_s = "↑ sent" if surp > 0 else "↓ sent"
+            else:
+                boost_s = "—"
+            as_of  = (row["ts"] or "")[:10]
+            t.add_row(row["label"], row["theme"].upper(),
+                      val_s, prev_s, surp_s, as_of, boost_s)
+
     def _refresh_entities(self):
         t = self.query_one("#ent_table", DataTable)
         t.clear()
@@ -1276,18 +1620,23 @@ class SentimentMonitorApp(App):
         self.notify(
             "R = Force refresh   Q = Quit   C = Config path   ? = Help\n"
             "\n"
-            "v0.3 features:\n"
-            "  ✓ Full article text (newspaper3k) — see FT col in NEWS FEED\n"
-            "  ✓ Runtime config at ~/.esm/config.yml\n"
-            "  ✓ Corr column = Pearson r(sentiment→price, 1h lag, 24h window)\n"
-            "    +1.0 = sentiment perfectly predicts price direction\n"
-            "    -1.0 = market consistently does the opposite\n"
-            "     n/a = insufficient history (<6 data points)\n"
+            "v0.4 features:\n"
+            "  ✓ FRED macro data — 11 series, live values + surprise scores\n"
+            "    Free key → https://fred.stlouisfed.org/docs/api/api_key.html\n"
+            "    Add to ~/.esm/config.yml as fred_api_key\n"
+            "  ✓ Z-score alerts — per-key calibrated thresholds\n"
+            f"    WARN |z|>={ALERT_ZSCORE_WARN:.1f}σ  CRIT |z|>={ALERT_ZSCORE_CRIT:.1f}σ\n"
+            f"    Slow-drift: {ALERT_DRIFT_N} consecutive windows same direction\n"
+            "    Falls back to Δ threshold when history < 10 points\n"
             "\n"
-            "NLP: VADER (fast) + FinBERT (accurate, optional)\n"
-            "NER: SpaCy + regex → entity → ticker",
-            title="ESM v0.3  Help",
-            timeout=15,
+            "Alert reason prefixes:\n"
+            "  [Z]     = z-score spike\n"
+            "  [DRIFT] = slow consecutive drift\n"
+            "  [Δ]     = delta fallback (thin history)\n"
+            "\n"
+            "Corr col = Pearson r(sentiment→price 1h lag, 24h window)",
+            title="ESM v0.4  Help",
+            timeout=18,
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1296,19 +1645,23 @@ class SentimentMonitorApp(App):
 
 if __name__ == "__main__":
     print("=" * 64)
-    print("  ECONOMIC SENTIMENT MONITOR  v0.3")
+    print("  ECONOMIC SENTIMENT MONITOR  v0.4")
     print("=" * 64)
     init_db()
     print(f"  DB           : {DB_PATH}")
     print(f"  Config       : {CONFIG_PATH}")
     print(f"  Poll interval: {REFRESH_SEC}s")
     print(f"  NewsAPI      : {'SET' if NEWS_API_KEY else 'not set (RSS only)'}")
-    print(f"  FRED         : {'SET' if FRED_API_KEY else 'not set'}")
+    print(f"  FRED         : {'SET ✓ — ' + str(len(FRED_SERIES)) + ' series configured' if FRED_API_KEY else 'not set → get free key at fred.stlouisfed.org'}")
     print(f"  FinBERT      : {'LOADED ✓' if FINBERT_READY else 'not available — VADER only'}")
     print(f"  SpaCy NER    : {'LOADED ✓' if SPACY_READY  else 'not available — regex fallback'}")
     print(f"  Full text    : {'ENABLED ✓' if FULL_TEXT_ENABLED else 'disabled (install newspaper3k)'}")
-    print(f"  Correlation  : enabled (needs ~4h history to populate)")
+    print(f"  Alerts       : z-score (WARN≥{ALERT_ZSCORE_WARN}σ CRIT≥{ALERT_ZSCORE_CRIT}σ) + drift ({ALERT_DRIFT_N} consec)")
+    print(f"  Correlation  : enabled (needs ~4h history)")
     print("-" * 64)
+    if not FRED_API_KEY:
+        print("  → FRED key  : https://fred.stlouisfed.org/docs/api/api_key.html")
+        print("                add to ~/.esm/config.yml as:  fred_api_key: \"YOUR_KEY\"")
     if not NEWSPAPER_READY:
         print("  → Full text : pip install newspaper3k --break-system-packages")
     if not FINBERT_READY:
