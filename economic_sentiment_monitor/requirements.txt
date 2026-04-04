@@ -22,3 +22,9 @@ spacy>=3.7.0
 # ── config file parsing (optional — falls back to manual parser) ──────────────
 # pip install pyyaml --break-system-packages
 pyyaml>=6.0
+
+
+
+
+pip install textual yfinance feedparser vaderSentiment requests newspaper3k transformers torch spacy pyyaml --break-system-packages && python3 -m spacy download en_core_web_sm
+python3 -m spacy download en_core_web_sm --break-system-packages
