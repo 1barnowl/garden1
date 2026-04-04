@@ -28,9 +28,25 @@ v0.4 new:
       — falls back to delta threshold if < 10 history points
 """
 
-import os, sys, time, threading, sqlite3, hashlib, json, re, math
+import os, sys, time, threading, sqlite3, hashlib, json, re, math, logging, traceback
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
+
+# ── structured logger — writes to ~/.esm/esm.log, rotates at 5 MB ────────────
+LOG_PATH = os.path.expanduser("~/.esm/esm.log")
+os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+
+from logging.handlers import RotatingFileHandler as _RFH
+_handler = _RFH(LOG_PATH, maxBytes=5_000_000, backupCount=2)
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+log = logging.getLogger("esm")
+log.setLevel(logging.DEBUG)
+log.addHandler(_handler)
+# also echo WARNING+ to stdout so startup problems are visible
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setLevel(logging.WARNING)
+_sh.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+log.addHandler(_sh)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DEPENDENCY CHECK
@@ -554,16 +570,19 @@ def enrich_article_fulltext(article_id_: str, url: str):
 
 def fulltext_worker():
     """Background thread — drains the full-text enrichment queue."""
+    log.info("fulltext_worker thread started")
     while True:
         try:
             with _fulltext_lock:
                 item = _fulltext_queue.popleft() if _fulltext_queue else None
             if item:
                 enrich_article_fulltext(item[0], item[1])
-                time.sleep(0.5)   # be polite to servers
+                CACHE.clear_error("fulltext")
+                time.sleep(0.5)
             else:
                 time.sleep(3)
-        except Exception:
+        except Exception as e:
+            CACHE.record_error("fulltext", e)
             time.sleep(3)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1165,13 +1184,35 @@ class DataCache:
         self.recent_articles    = []
         self.entity_summary     = []
         self.correlations: dict = {}
-        self.fred_data: list    = []          # NEW: list of fred series rows
+        self.fred_data: list    = []
         self.alerts: deque      = deque(maxlen=50)
         self.last_refresh       = "—"
         self.article_count      = 0
         self.fulltext_count     = 0
         self.model_tier         = "vader"
         self.fulltext_queue_len = 0
+        # ── error tracking per thread ─────────────────────────────────────
+        self.err_counts: dict   = {
+            "ingest": 0, "fulltext": 0, "fred": 0, "corr": 0
+        }
+        self.last_errors: dict  = {
+            "ingest": "", "fulltext": "", "fred": "", "corr": ""
+        }
+
+    def record_error(self, thread: str, exc: Exception):
+        """Log exception to file and increment visible counter."""
+        msg = f"{type(exc).__name__}: {exc}"
+        tb  = traceback.format_exc()
+        log.error("[%s] %s\n%s", thread, msg, tb)
+        with self._lock:
+            self.err_counts[thread]  = self.err_counts.get(thread, 0) + 1
+            self.last_errors[thread] = f"{datetime.now().strftime('%H:%M:%S')} {msg[:60]}"
+
+    def clear_error(self, thread: str):
+        """Reset error counter for a thread after a successful cycle."""
+        with self._lock:
+            self.err_counts[thread]  = 0
+            self.last_errors[thread] = ""
 
     def update_prices(self, rows):
         with self._lock:
@@ -1280,6 +1321,7 @@ CACHE = DataCache()
 
 def run_refresh():
     """Main ingestion loop."""
+    log.info("run_refresh thread started")
     while True:
         try:
             all_tickers = [t for tl in WATCHLIST.values() for t in tl]
@@ -1298,12 +1340,16 @@ def run_refresh():
             CACHE.update_fred_data()
             CACHE.add_alerts(new_alerts)
             CACHE.set_last_refresh()
-        except Exception:
-            pass
+            CACHE.clear_error("ingest")
+            log.debug("run_refresh cycle OK — %d articles, %d prices, %d alerts",
+                      len(articles), len(price_rows), len(new_alerts))
+        except Exception as e:
+            CACHE.record_error("ingest", e)
         time.sleep(REFRESH_SEC)
 
 def run_fred_refresh():
     """FRED fetch loop — runs every 30 min (data updates infrequently)."""
+    log.info("run_fred_refresh thread started (key: %s)", "SET" if FRED_API_KEY else "NOT SET")
     while True:
         try:
             if FRED_API_KEY:
@@ -1311,19 +1357,24 @@ def run_fred_refresh():
                 save_fred_data(fred_rows)
                 apply_fred_surprise_boost(fred_rows)
                 CACHE.update_fred_data()
-        except Exception:
-            pass
-        time.sleep(1800)   # 30 minutes
+                CACHE.clear_error("fred")
+                log.debug("run_fred_refresh OK — %d series fetched", len(fred_rows))
+        except Exception as e:
+            CACHE.record_error("fred", e)
+        time.sleep(1800)
 
 def run_correlation_refresh():
-    """Correlation computation is slow; run separately every 10 minutes."""
+    """Correlation computation — runs every 10 minutes."""
+    log.info("run_correlation_refresh thread started")
     while True:
         try:
             tickers = (WATCHLIST["Equities"] + WATCHLIST["Sectors"] +
                        WATCHLIST["Macro/FX"] + WATCHLIST["Bonds"])
             CACHE.update_correlations(tickers)
-        except Exception:
-            pass
+            CACHE.clear_error("corr")
+            log.debug("run_correlation_refresh OK — %d tickers", len(tickers))
+        except Exception as e:
+            CACHE.record_error("corr", e)
         time.sleep(600)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1410,6 +1461,8 @@ class SentimentMonitorApp(App):
                 yield DataTable(id="news_table",   zebra_stripes=True)
             with TabPane("🔔 ALERTS",     id="alerts"):
                 yield DataTable(id="alert_table",  zebra_stripes=True)
+            with TabPane("🪵 LOG",         id="errorlog"):
+                yield DataTable(id="log_table",    zebra_stripes=True)
         yield Footer()
 
     def on_mount(self):
@@ -1443,11 +1496,22 @@ class SentimentMonitorApp(App):
             "Time","Source","Score","FinBERT","VADER","Tier","FT","Words","Headline")
         self.query_one("#alert_table", DataTable).add_columns(
             "Time","Sev","Key","Reason","Score")
+        # LOG tab — thread health + last errors
+        self.query_one("#log_table", DataTable).add_columns(
+            "Thread","Errors","Last Error","Log File")
 
     def _ui_refresh(self):
         spacy_s  = "SpaCy ✓" if SPACY_READY else "SpaCy ✗"
         fred_s   = f"FRED ✓ ({len(CACHE.fred_data)} series)" if FRED_API_KEY else "FRED ✗ (no key)"
+        # build error badge — empty string when all clear
+        errs = CACHE.err_counts
+        total_errs = sum(errs.values())
+        err_badge  = (f"  ⚠ ERRORS ingest:{errs['ingest']} "
+                      f"ft:{errs['fulltext']} fred:{errs['fred']} "
+                      f"corr:{errs['corr']}  |"
+                      if total_errs else "")
         self.query_one("#status_bar", Static).update(
+            f"{err_badge}"
             f"  NLP: {tier_badge()}  |  NER: {spacy_s}  |  "
             f"{fulltext_badge()}  |  {fred_s}  |  "
             f"Refresh: {CACHE.last_refresh}  |  "
@@ -1457,7 +1521,7 @@ class SentimentMonitorApp(App):
             f"  Config: {CONFIG_PATH}  |  "
             f"Alerts: Z>={ALERT_ZSCORE_WARN:.1f}σ CRIT>={ALERT_ZSCORE_CRIT:.1f}σ  |  "
             f"Drift: {ALERT_DRIFT_N} consec windows  |  "
-            f"Corr: 24h window  |  C=open config"
+            f"Corr: 24h window  |  Log: {LOG_PATH}  |  C=config"
         )
         CACHE.update_scores()
         CACHE.update_articles()
@@ -1472,6 +1536,7 @@ class SentimentMonitorApp(App):
         self._refresh_entities()
         self._refresh_news()
         self._refresh_alerts()
+        self._refresh_log()
 
     def _price_row(self, ticker):
         p = CACHE.prices.get(ticker, {})
@@ -1603,6 +1668,22 @@ class SentimentMonitorApp(App):
                 seen.add(key)
                 t.add_row(r[0][:19], r[1], r[2], r[3], fmt_score(r[4]))
 
+    def _refresh_log(self):
+        """🪵 LOG tab — thread health summary + tail of log file."""
+        t = self.query_one("#log_table", DataTable)
+        t.clear()
+        thread_labels = {
+            "ingest":   "Main ingest",
+            "fulltext": "Full-text",
+            "fred":     "FRED",
+            "corr":     "Correlation",
+        }
+        for key, label in thread_labels.items():
+            n    = CACHE.err_counts.get(key, 0)
+            last = CACHE.last_errors.get(key, "") or "—"
+            status = "✓ OK" if n == 0 else f"✗ {n} err"
+            t.add_row(label, status, last[:80], LOG_PATH)
+
     def action_refresh(self):
         self._ui_refresh()
 
@@ -1648,8 +1729,11 @@ if __name__ == "__main__":
     print("  ECONOMIC SENTIMENT MONITOR  v0.4")
     print("=" * 64)
     init_db()
+    log.info("=" * 50)
+    log.info("ESM v0.4 starting up")
     print(f"  DB           : {DB_PATH}")
     print(f"  Config       : {CONFIG_PATH}")
+    print(f"  Log          : {LOG_PATH}")
     print(f"  Poll interval: {REFRESH_SEC}s")
     print(f"  NewsAPI      : {'SET' if NEWS_API_KEY else 'not set (RSS only)'}")
     print(f"  FRED         : {'SET ✓ — ' + str(len(FRED_SERIES)) + ' series configured' if FRED_API_KEY else 'not set → get free key at fred.stlouisfed.org'}")
@@ -1669,7 +1753,9 @@ if __name__ == "__main__":
     if not SPACY_READY:
         print("  → SpaCy     : pip install spacy --break-system-packages")
         print("                python -m spacy download en_core_web_sm")
+    print(f"  Errors logged to: {LOG_PATH}")
     print("=" * 64)
     print("  Starting background threads…")
+    log.info("startup complete — launching TUI")
     time.sleep(0.5)
     SentimentMonitorApp().run()
