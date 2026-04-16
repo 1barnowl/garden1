@@ -156,9 +156,65 @@ market_terminal/
 └─ data/
 ```
 
+How to extract,install:
+
+
+
+# ===== 1) Go to the folder where the zip is =====
+cd /path/to/the/folder/that/contains/the/zip
+
+# ===== 2) Extract it =====
+unzip YOUR_PROJECT.zip
+
+# ===== 3) Enter the extracted project folder =====
+cd YOUR_EXTRACTED_FOLDER
+
+# ===== 4) Create and activate a virtual environment =====
+python3 -m venv .venv
+source .venv/bin/activate
+
+# ===== 5) Upgrade packaging tools =====
+python -m pip install --upgrade pip setuptools wheel
+
+# ===== 6) Install dependencies =====
+# If the project has requirements.txt:
+pip install -r requirements.txt
+
+# If the project uses pyproject.toml and editable install:
+pip install -e .
+
+# ===== 7) Run the app =====
+python main.py
+
+
+
+If pip install -e . fails because of the backend issue, use this fix before reinstalling:
+
+sed -i 's/setuptools.backends.legacy:build/setuptools.build_meta/' pyproject.toml
+pip install -e .
+
+
+
+A clean checklist version is:
+
+cd /path/to/project
+unzip YOUR_PROJECT.zip
+cd YOUR_EXTRACTED_FOLDER
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+python main.py
+
+
+
+
+
+
+
 ---
 
-## Roadmap (v0.9+)
+## Roadmap (v0.11+)
 
 - [ ] FastAPI REST + WebSocket layer for web UI
 - [ ] SEC EDGAR filing ingestion + full-text search
