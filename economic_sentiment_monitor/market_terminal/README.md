@@ -1,4 +1,4 @@
-# Economic Sentiment Monitor  v0.8
+# Economic Sentiment Monitor  v0.11
 
 A Bloomberg-style terminal TUI that ingests financial news, scores sentiment with VADER + FinBERT, tracks market prices, and surfaces real-time macro signals — all in a local SQLite-backed Python app.
 
