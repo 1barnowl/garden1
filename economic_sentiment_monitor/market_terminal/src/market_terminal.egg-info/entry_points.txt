@@ -1,0 +1,2 @@
+[console_scripts]
+market-terminal = market_terminal.ui.app:main
