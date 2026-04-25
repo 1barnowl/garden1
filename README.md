@@ -6,7 +6,7 @@ Garden1 functions as a distributed, event-driven economic intelligence subsystem
 
 ## Constituent Subsystems
 
-- 
+- TradeDistrict
 - Economic Sentiment Monitor
 
 ## Comprehensive Capabilities
