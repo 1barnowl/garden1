@@ -1,21 +1,21 @@
-# Economic Sentiment Monitor  v0.11
+# Market Monitor  v0.11
 
 A Bloomberg-style terminal TUI that ingests financial news, scores sentiment with VADER + FinBERT, tracks market prices, and surfaces real-time macro signals — all in a local SQLite-backed Python app.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  ESM  //  Economic Sentiment Monitor  v0.8                      │
+│  ESM  //  Market Monitor  v0.8                                  │
 ├─────────────────────────────────────────────────────────────────┤
-│  [FB+VD]  NER:✓  FT:142  FRED:14s  │  Price:15s  News:30s     │
-│  FEAR/GREED [████████░░░░░░░░░░░░░░░░░░] +24 GREED             │
-│  REGIME: RISK-ON ▲  conf:72%  │  FG:+24 greed  vol:low        │
+│  [FB+VD]  NER:✓  FT:142  FRED:14s  │  Price:15s  News:30s       │
+│  FEAR/GREED [████████░░░░░░░░░░░░░░░░░░] +24 GREED              │
+│  REGIME: RISK-ON ▲  conf:72%  │  FG:+24 greed  vol:low          │
 ├──────────────────────────────────────────────────────────────────┤
-│  1:EQUITIES  2:MACRO/FX  3:BONDS  4:SECTORS  5:SENTIMENT  ...  │
+│  1:EQUITIES  2:MACRO/FX  3:BONDS  4:SECTORS  5:SENTIMENT  ...   │
 ├──────────────────────────────────────────────────────────────────┤
-│  Ticker  Price      Chg%    Sent 1h   Spark       Corr  Bayes  │
-│  AAPL    189.4200  +0.84%  +0.1240  ▄▅▆▇█───   +0.41  BULL   │
-│  MSFT    415.8100  +0.23%  +0.0890  ▃▄▄▅▆───   +0.33  BULL   │
-│  NVDA    875.2300  +1.47%  +0.2180  ▅▆▇███───  +0.68  BULL   │
+│  Ticker  Price      Chg%    Sent 1h   Spark       Corr  Bayes   │
+│  AAPL    189.4200  +0.84%  +0.1240  ▄▅▆▇█───   +0.41  BULL    │
+│  MSFT    415.8100  +0.23%  +0.0890  ▃▄▄▅▆───   +0.33  BULL    │
+│  NVDA    875.2300  +1.47%  +0.2180  ▅▆▇███───  +0.68  BULL    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
