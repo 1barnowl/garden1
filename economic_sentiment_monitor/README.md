@@ -9,9 +9,9 @@ A Bloomberg-style terminal TUI that ingests financial news, scores sentiment wit
 │  [FB+VD]  NER:✓  FT:142  FRED:14s  │  Price:15s  News:30s       │
 │  FEAR/GREED [████████░░░░░░░░░░░░░░░░░░] +24 GREED              │
 │  REGIME: RISK-ON ▲  conf:72%  │  FG:+24 greed  vol:low          │
-├──────────────────────────────────────────────────────────────────┤
+├─────────────────────────────────────────────────────────────────┤
 │  1:EQUITIES  2:MACRO/FX  3:BONDS  4:SECTORS  5:SENTIMENT  ...   │
-├──────────────────────────────────────────────────────────────────┤
+├─────────────────────────────────────────────────────────────────┤
 │  Ticker  Price      Chg%    Sent 1h   Spark       Corr  Bayes   │
 │  AAPL    189.4200  +0.84%  +0.1240  ▄▅▆▇█───   +0.41  BULL    │
 │  MSFT    415.8100  +0.23%  +0.0890  ▃▄▄▅▆───   +0.33  BULL    │
